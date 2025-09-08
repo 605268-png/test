@@ -1,287 +1,243 @@
-/** ===== STOCKS (FBO+FBS) ===== **/
-
-/**
- * Этот модуль собирает остатки по FBS-складам продавца.
- * Алгоритм:
- *  1) читаем список nmId (Map_NMID -> Ads_API как резерв);
- *  2) через Content API получаем штрих-коды (skus) для этих nmId;
- *  3) получаем список складов /api/v3/warehouses;
- *  4) для каждого склада отправляем POST /api/v3/stocks/{warehouseId} со списком skus;
- *  5) из ответа берём amount и маппим sku -> nmId; агрегируем по nmId+склад;
- *  6) пишем в лист Stocks_API: [nmId, Склад, Кол-во].
- *
- * ВАЖНО:
- *  - WB /api/v3/stocks/{warehouseId} ожидает ТОЛЬКО { "skus": [...] }.
- *  - В ответе остаток в поле "amount" (не quantity/qty/stock).
- */
+/** ===== DIAG: STOCKS (FBO+FBS) ===== **/
 
 const SHEET_STOCKS_API = 'Stocks_API';
+const SHEET_RAW_STOCKS = 'Raw_Stocks';
 
-// Обёртка под старое меню
-function WB_collectStocksPlusFBS() { return WB_collectStocks(); }
-
-/** Точка входа */
-function WB_collectStocks() {
+function WB_collectStocks(){
   const S = getSettings_();
-  const auth = (S.stockToken && String(S.stockToken).trim()) || S.token;
+  const auth = (S.stockToken && S.stockToken.trim()) || S.token;
   if (!auth) throw new Error('Нет токена Authorization (Settings → API токен).');
 
-  const headersMP = { 'Authorization': auth, 'Content-Type': 'application/json', 'Accept':'application/json' };
-  const headersCT = headersMP; // тот же токен для Content API
+  const H_MP = { 'Authorization': auth, 'Content-Type':'application/json', 'Accept':'application/json' };
+  const H_CT = H_MP;
 
   log_('INFO','Stocks','start','Сбор остатков (FBO+FBS)', null);
 
-  // 1) nmId
-  const nmSet = _stocks_readNmIds_();
-  if (nmSet.size === 0) {
-    log_('WARN','Stocks','empty_nm','Нет nmId (проверь Map_NMID / Ads_API).', null);
-    _stocks_writeTable_([]);
-    log_('INFO','Stocks','done','Stocks_API: 0 строк', { rows: 0 });
-    return;
-  }
+  // 1) nmID из Map_NMID + Ads_Nm_Cache + Ads_API (объединяем без дублей)
+  const nmSet = _nm_collectAll_();
+  const nmAll = Array.from(nmSet);
+  log_('INFO','Stocks','nm_source', `Взято из Map_NMID/Ads: ${nmAll.length} nmId`, null);
+  if (nmAll.length === 0){ _stocks_writeTable_([]); log_('INFO','Stocks','done','Stocks_API: 0 строк', {rows:0}); return; }
 
-  // 2) индексы nm <-> skus через Content API
-  const { mapNmToSkus, mapSkuToNm, nmWithSkuCount } = _buildSkuIndexFromContent_(headersCT, nmSet);
-  log_('INFO','Stocks','index_stats', `nmTotal:${nmSet.size}, nmWithSku:${nmWithSkuCount}`, null);
+  // 2) склады продавца
+  const warehouses = _stocks_getWarehouses_(H_MP);
+  if (!warehouses.length){ log_('WARN','Stocks','wh_empty','Склады не найдены (GET /api/v3/warehouses)', null); _stocks_writeTable_([]); return; }
+  log_('INFO','Stocks','wh_summary', `Найдено складов: ${warehouses.length}`, {wh: warehouses.map(x=>({id:x.id,name:x.name})).slice(0,20)});
 
-  if (nmWithSkuCount === 0) {
-    log_('WARN','Stocks','no_sku_for_nm','Не нашли ни одного SKU для переданных nmId', null);
-    _stocks_writeTable_([]);
-    log_('INFO','Stocks','done','Stocks_API: 0 строк', { rows: 0 });
-    return;
-  }
+  // 3) nm -> sku индексация
+  const idx = _buildSkuIndex_(H_CT, nmAll);
+  const totalSkus = Array.from(idx.mapNmToSkus.values()).reduce((a,s)=>a+s.size,0);
+  log_('INFO','Stocks','index_stats', `nmTotal:${nmAll.length}, nmWithSku:${idx.mapNmToSkus.size}, skuTotal:${totalSkus}`, null);
 
-  // 3) склады
-  const warehouses = _stocks_getWarehouses_(headersMP);
-  if (!warehouses.length) {
-    log_('WARN','Stocks','endpoint_fail','Склады не найдены (эндпоинт недоступен).', null);
-    _stocks_writeTable_([]);
-    log_('INFO','Stocks','done','Stocks_API: 0 строк', { rows: 0 });
-    return;
-  }
+  // 4) запросы по складам: шлём SKU, разворачиваем ответ в RAW и агрегируем по nmId
+  _raw_clear_();
+  const out = [];
+  let sentSkus = 0, gotItems = 0, nonZero = 0;
 
-  // 4) отправляем SKU по складам, агрегируем nmId+склад
-  const agg = new Map(); // key = nmId|whName -> sum(amount)
-  const CH_SKU = 100;    // безопасная пачка
-
-  for (const wh of warehouses) {
-    const whId = Number(wh.id);
-    const whName = String(wh.name || '');
-
-    // Соберём единый массив всех SKU, которые есть у наших nmId
+  const CHUNK = 300; // безопасный батч
+  for (const wh of warehouses){
     const skuAll = [];
-    mapNmToSkus.forEach(set => set.forEach(s => skuAll.push(String(s))));
-    if (!skuAll.length) continue;
+    idx.mapNmToSkus.forEach(set => set.forEach(s => skuAll.push(s)));
+    for (let i=0;i<skuAll.length;i+=CHUNK){
+      const part = skuAll.slice(i,i+CHUNK);
+      sentSkus += part.length;
+      const items = _stocks_fetchBySkus_(H_MP, wh.id, part); // [{sku, amount}]
+      gotItems += items.length;
 
-    for (let i = 0; i < skuAll.length; i += CH_SKU) {
-      const part = skuAll.slice(i, i + CH_SKU);
-      const rows = _stocks_postOneBatch_(headersMP, whId, whName, part, mapSkuToNm);
-      if (rows && rows.length) {
-        for (const [nm, whN, qty] of rows) {
-          const key = `${nm}|${whN}`;
-          const prev = agg.get(key) || 0;
-          agg.set(key, prev + qty);
+      // развернём в RAW и агрегируем по nm
+      for (const it of items){
+        const sku = String(it.sku||'');
+        const qty = Number(it.amount||0);
+        const nm  = idx.mapSkuToNm.get(sku) || 0;
+        _raw_append_([new Date(), wh.id, wh.name, nm, sku, qty]);
+        if (qty>0) nonZero++;
+
+        if (nm && wh.name){
+          out.push([nm, wh.name, qty]);
         }
       }
     }
   }
 
-  // 5) в таблицу
-  const outRows = [];
-  agg.forEach((qty, key) => {
-    const [nm, whName] = key.split('|');
-    outRows.push([Number(nm), whName, qty]);
-  });
+  // запись сводной таблицы (nmId / Склад / Кол-во)
+  _stocks_writeTable_(out);
 
-  _stocks_writeTable_(outRows);
-  log_('INFO','Stocks','done', `Stocks_API: ${outRows.length} строк`, { rows: outRows.length });
+  log_('INFO','Stocks','done', `Stocks_API: ${out.length} строк`, { rows: out.length, sentSkus, gotItems, nonZero });
 }
 
-/* -------------------- helpers -------------------- */
+/* === helpers === */
 
-/** Читает nmId: приоритет Map_NMID, резерв Ads_API */
-function _stocks_readNmIds_() {
+// объединяем источники nmId
+function _nm_collectAll_(){
   const ss = SpreadsheetApp.getActive();
   const set = new Set();
 
-  // Map_NMID: предполагаем, что в колонке B лежит nmId (как в твоём проекте)
   const shMap = ss.getSheetByName('Map_NMID');
-  if (shMap && shMap.getLastRow() > 1) {
-    const values = shMap.getRange(2, 2, shMap.getLastRow() - 1, 1).getValues();
-    for (const [nm] of values) {
-      const v = Number(nm);
-      if (Number.isFinite(v) && v > 0) set.add(v);
-    }
+  if (shMap && shMap.getLastRow()>1){
+    const v = shMap.getRange(2,1,shMap.getLastRow()-1,2).getValues();
+    v.forEach(r => { const nm = Number(r[1]); if (nm) set.add(nm); });
   }
-  if (set.size) return set;
-
-  // Резерв — Ads_API: ищем колонку с nm
+  const shAdsCache = ss.getSheetByName('Ads_Nm_Cache');
+  if (shAdsCache && shAdsCache.getLastRow()>1){
+    const v = shAdsCache.getRange(2,1,shAdsCache.getLastRow()-1,1).getValues();
+    v.forEach(r => { const nm = Number(r[0]); if (nm) set.add(nm); });
+  }
   const shAds = ss.getSheetByName('Ads_API');
-  if (shAds && shAds.getLastRow() > 1) {
-    const H = shAds.getRange(1,1,1, shAds.getLastColumn()).getDisplayValues()[0].map(s => String(s).toLowerCase());
+  if (shAds && shAds.getLastRow()>1){
+    const H = shAds.getRange(1,1,1,shAds.getLastColumn()).getDisplayValues()[0].map(s=>String(s).toLowerCase());
     const cNm = H.findIndex(h => h.includes('nm'));
-    if (cNm >= 0) {
-      const v = shAds.getRange(2,1, shAds.getLastRow()-1, shAds.getLastColumn()).getValues();
-      v.forEach(r => { const nm = Number(r[cNm]); if (Number.isFinite(nm) && nm > 0) set.add(nm); });
+    if (cNm>=0){
+      const v = shAds.getRange(2,1,shAds.getLastRow()-1,shAds.getLastColumn()).getValues();
+      v.forEach(r => { const nm = Number(r[cNm]); if (nm) set.add(nm); });
     }
   }
   return set;
 }
 
-/** Получаем список FBS-складов продавца */
-function _stocks_getWarehouses_(headers) {
+// склады продавца
+function _stocks_getWarehouses_(headers){
   const url = 'https://marketplace-api.wildberries.ru/api/v3/warehouses';
   const t0 = Date.now();
-  const res = UrlFetchApp.fetch(url, { method: 'get', headers, muteHttpExceptions: true });
-  const code = res.getResponseCode(), body = res.getContentText() || '';
-  log_('INFO','HTTP','response', `${code} ${url} (${Date.now()-t0} ms)`, { respBytes: body.length });
+  const res = UrlFetchApp.fetch(url, {method:'get', headers, muteHttpExceptions:true});
+  const code = res.getResponseCode(), body = res.getContentText()||'';
+  log_('INFO','HTTP','response', `${code} ${url} (${Date.now()-t0} ms)`, {respBytes: body.length});
 
-  if (code !== 200) return [];
-  try {
-    const j = JSON.parse(body || '[]');
-    const arr = Array.isArray(j) ? j : (j?.warehouses || j?.data || []);
-    return arr
-      .map(x => ({
-        id: Number(x?.id ?? x?.warehouseId ?? x?.warehouse_id),
-        name: String(x?.name ?? x?.warehouseName ?? x?.office ?? '')
-      }))
-      .filter(x => x.id && x.name);
-  } catch(e) {
-    return [];
-  }
+  if (code!==200) return [];
+  try{
+    const j = JSON.parse(body||'[]');
+    const arr = Array.isArray(j) ? j : (j?.data || j?.warehouses || []);
+    return arr.map(x => ({
+      id: Number(x?.id ?? x?.warehouseId ?? x?.warehouse_id),
+      name: String(x?.name ?? x?.warehouseName ?? x?.office ?? '')
+    })).filter(x => x.id && x.name);
+  }catch(_){ return []; }
 }
 
-/**
- * Строим индексы nmId <-> skus по Content API v2/get/cards/list
- * Возвращает:
- *  - mapNmToSkus: Map<nmId, Set<sku>>
- *  - mapSkuToNm : Map<sku, nmId>
- */
-function _buildSkuIndexFromContent_(headersContent, nmSet) {
-  const url = 'https://content-api.wildberries.ru/content/v2/get/cards/list';
-  const nmAll = Array.from(nmSet);
-  const CH = 100; // пачка nmID
-
+// индекс nm <-> sku (через Content API V2)
+function _buildSkuIndex_(headers, nmAll){
   const mapNmToSkus = new Map();
   const mapSkuToNm  = new Map();
-  let nmWithSku = 0;
+  const url = 'https://content-api.wildberries.ru/content/v2/get/cards/list';
 
-  for (let i = 0; i < nmAll.length; i += CH) {
-    const part = nmAll.slice(i, i + CH);
-    // WB v2: filter.nmID + cursor.limit
-    const payload = JSON.stringify({
-      sort:   { cursor: { limit: 1000 } },
-      filter: { nmID: part }
-    });
-
+  const CH = 100;
+  for (let i=0;i<nmAll.length;i+=CH){
+    const part = nmAll.slice(i,i+CH);
+    const body = JSON.stringify({ sort:{cursor:{limit:1000}}, filter:{ nmID: part } });
     const t0 = Date.now();
-    const res = UrlFetchApp.fetch(url, {
-      method: 'post',
-      headers: headersContent,
-      payload,
-      muteHttpExceptions: true
-    });
-    const code = res.getResponseCode();
-    const text = res.getContentText() || '';
+    const res = UrlFetchApp.fetch(url, {method:'post', headers, payload: body, muteHttpExceptions:true});
+    const code = res.getResponseCode(), text = res.getContentText()||'';
+    log_('INFO','HTTP','response', `${code} ${url} (${Date.now()-t0} ms)`, {variant:'v2.cursor.filter.nmID', respBytes: String(text).length});
+    if (code!==200) continue;
 
-    log_('INFO','HTTP','response', `${code} ${url} (${Date.now()-t0} ms)`,
-      { variant: 'v2.cursor.filter.nmID', respBytes: String(text).length });
-
-    if (code !== 200) { Utilities.sleep(300); continue; }
-
-    try {
-      const j = JSON.parse(text || '{}');
+    try{
+      const j = JSON.parse(text||'{}');
       const cards = j?.data?.cards || j?.cards || [];
-      for (const c of cards) {
+      for (const c of cards){
         const nm = Number(c?.nmID ?? c?.nmId ?? c?.nmid ?? c?.nm);
         if (!nm) continue;
-
         const sizes = Array.isArray(c?.sizes) ? c.sizes : [];
-        let hasSku = false;
-
-        for (const s of sizes) {
-          const skus = Array.isArray(s?.skus) ? s.skus : [];
-          for (const skuRaw of skus) {
-            const sku = String(typeof skuRaw === 'object' && skuRaw ? skuRaw?.sku ?? '' : skuRaw || '');
+        for (const s of sizes){
+          const arr = Array.isArray(s?.skus) ? s.skus : [];
+          for (const raw of arr){
+            const sku = String((typeof raw==='object' && raw ? raw.sku : raw)||'').trim();
             if (!sku) continue;
-
-            hasSku = true;
             if (!mapNmToSkus.has(nm)) mapNmToSkus.set(nm, new Set());
             mapNmToSkus.get(nm).add(sku);
-            if (!mapSkuToNm.has(sku)) mapSkuToNm.set(sku, nm);
+            mapSkuToNm.set(sku, nm);
           }
         }
-        if (hasSku) nmWithSku++;
       }
-    } catch(_) { /* пропускаем неудачный чанок */ }
-
-    Utilities.sleep(150);
+    }catch(_){}
   }
-
-  // Логируем небольшую выборку отсутствующих SKU
-  const missing = nmAll.filter(nm => !(mapNmToSkus.get(nm)?.size));
-  if (missing.length) {
-    log_('WARN','Stocks','no_sku_for_nm','Не нашли SKU для части nmId', { missing: missing.slice(0,50) });
-  }
-
-  return { mapNmToSkus, mapSkuToNm, nmWithSkuCount: nmWithSku };
+  return { mapNmToSkus, mapSkuToNm };
 }
 
-/**
- * Отправляет на склад список SKU и возвращает строки [nmId, whName, qty].
- * ВАЖНО: qty берём из поля "amount".
- */
-function _stocks_postOneBatch_(headers, whId, whName, skuBatch, mapSkuToNm) {
+// запрос остатков по SKU для одного склада
+function _stocks_fetchBySkus_(headers, whId, skus){
   const url = `https://marketplace-api.wildberries.ru/api/v3/stocks/${whId}`;
-  const payload = JSON.stringify({ skus: skuBatch });
-
-  let attempts = 0;
-  while (attempts < 4) {
-    attempts++;
-    const t0 = Date.now();
-    const res = UrlFetchApp.fetch(url, {
-      method: 'post',
-      headers,
-      payload,
-      muteHttpExceptions: true
-    });
-    const code = res.getResponseCode();
-    const text = res.getContentText() || '';
-
-    log_('INFO','HTTP','response', `${code} ${url} (${Date.now()-t0} ms)`,
-      { whId, whName, batch: skuBatch.length, bodyKey: 'skus', respBytes: String(text).length });
-
-    if (code === 200) {
-      const out = [];
-      try {
-        const j   = JSON.parse(text || '{}');
-        const arr = Array.isArray(j) ? j : (j.stocks || j.data?.stocks || []);
-        for (const it of arr) {
-          const sku = String(it?.sku || '');
-          const nm  = mapSkuToNm.get(sku);
-          const qty = Number(it?.amount ?? 0);   // ← КЛЮЧЕВОЕ: amount
-          if (nm && Number.isFinite(qty)) out.push([nm, whName, qty]);
-        }
-      } catch(_) {}
-      return out;
-    }
-
-    if (code === 429) { Utilities.sleep(1500); continue; } // лимитер
-    if (code === 400) {                                    // тело не приняли — значит проблема со SKU
-      log_('WARN','Stocks','400','WB отклонил тело (skus). Проверь skuBatch.', { sample: skuBatch.slice(0,10) });
-      return [];
-    }
-    if (code === 401 || code === 403) {
-      throw new Error('Stocks API: 401/403 — проверь токен и права «Маркетплейс/Поставки».');
-    }
-
-    Utilities.sleep(700);
-  }
-  return [];
+  const body = JSON.stringify({ skus });
+  const t0 = Date.now();
+  const res = UrlFetchApp.fetch(url, {method:'post', headers, payload: body, muteHttpExceptions:true});
+  const code = res.getResponseCode(), text = res.getContentText()||'';
+  log_('INFO','HTTP','response', `${code} ${url} (${Date.now()-t0} ms)`, {whId, bodyKey:'skus', batch: skus.length, respBytes: String(text).length});
+  if (code!==200) return [];
+  try{
+    const j = JSON.parse(text||'[]');
+    return Array.isArray(j) ? j : (j?.stocks || j?.data || []);
+  }catch(_){ return []; }
 }
 
-/** Пишем сводную таблицу */
-function _stocks_writeTable_(rows) {
+function WB_debugSkuIndex(){
+  const S = getSettings_();
+  const auth = (S.stockToken && S.stockToken.trim()) || S.token;
+  if (!auth) throw new Error('Нет токена Authorization (Settings → API токен).');
+
+  const H_CT = { 'Authorization': auth, 'Content-Type':'application/json', 'Accept':'application/json' };
+
+  // 1) Соберём все nmID (Map_NMID + Ads_Nm_Cache + Ads_API)
+  const nmSet = _nm_collectAll_();
+  const nmAll = Array.from(nmSet);
+
+  // 2) Построим индекс nm <-> sku (через Content API)
+  const idx = _buildSkuIndex_(H_CT, nmAll);
+
+  // 3) Выгрузим в лист Sku_Index: nmId, sku (по одной строке на связку)
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Sku_Index') || ss.insertSheet('Sku_Index');
+  sh.clearContents();
+  sh.getRange(1,1,1,2).setValues([['nmId','sku']]);
+
+  const rows = [];
+  idx.mapNmToSkus.forEach((set, nm) => {
+    set.forEach(sku => rows.push([nm, String(sku)]));
+  });
+
+  if (rows.length) sh.getRange(2,1,rows.length,2).setValues(rows);
+  sh.setFrozenRows(1);
+
+  // Итоговая строка с цифрами — чтобы было видно масштаб
+  sh.getRange(1,4,1,2).setValues([['nmTotal', nmAll.length]]);
+  sh.getRange(2,4,1,2).setValues([['nmWithSku', idx.mapNmToSkus.size]]);
+  const totalSkus = rows.length;
+  sh.getRange(3,4,1,2).setValues([['skuTotal', totalSkus]]);
+}
+
+function WB_debugSkuFor(nm){
+  const S = getSettings_();
+  const auth = (S.stockToken && S.stockToken.trim()) || S.token;
+  if (!auth) throw new Error('Нет токена Authorization (Settings → API токен).');
+  const H_CT = { 'Authorization': auth, 'Content-Type':'application/json', 'Accept':'application/json' };
+
+  const idx = _buildSkuIndex_(H_CT, [Number(nm)]);
+  const set = idx.mapNmToSkus.get(Number(nm)) || new Set();
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Sku_Index') || ss.insertSheet('Sku_Index');
+  sh.clearContents();
+  sh.getRange(1,1,1,2).setValues([['nmId','sku']]);
+  const rows = Array.from(set).map(s => [Number(nm), String(s)]);
+  if (rows.length) sh.getRange(2,1,rows.length,2).setValues(rows);
+  sh.setFrozenRows(1);
+}
+
+
+// RAW
+function _raw_clear_(){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(SHEET_RAW_STOCKS) || ss.insertSheet(SHEET_RAW_STOCKS);
+  sh.clearContents();
+  sh.getRange(1,1,1,6).setValues([['ts','whId','whName','nmId','sku','amount']]);
+  sh.setFrozenRows(1);
+}
+function _raw_append_(row){
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(SHEET_RAW_STOCKS);
+  const lr = sh.getLastRow();
+  sh.getRange(lr+1,1,1,row.length).setValues([row]);
+}
+
+// сводная таблица nm / склад / qty
+function _stocks_writeTable_(rows){
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(SHEET_STOCKS_API) || ss.insertSheet(SHEET_STOCKS_API);
   sh.clearContents();
